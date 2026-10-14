@@ -1,0 +1,21 @@
+definition_version: "2"
+env:
+  BAKERY_APP_NAME: bakery_app
+  BAKERY_APP_DB: BAKERY_DB
+  BAKERY_APP_SCHEMA: APPS
+  BAKERY_APP_WH: BAKERY_WH
+
+entities:
+  bakery_app:
+    type: streamlit
+    identifier:
+      name: <% ctx.env.BAKERY_APP_NAME %>
+      database: <% ctx.env.BAKERY_APP_DB %>
+      schema: <% ctx.env.BAKERY_APP_SCHEMA %>
+    main_file: streamlit_app.py
+    query_warehouse: <% ctx.env.BAKERY_APP_WH %>
+    stage: <% ctx.env.BAKERY_APP_NAME %>
+    artifacts:
+      - streamlit_app.py
+      - environment.yml
+      - common/data_utils.py
