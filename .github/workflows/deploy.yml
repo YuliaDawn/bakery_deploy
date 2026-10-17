@@ -1,0 +1,151 @@
+name: Deploy
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  push:
+    paths:
+      - "de/**"
+      - "data/*.csv"
+      - "app/**"
+env:
+  SNOWFLAKE_DEFAULT_CONNECTION_NAME: "workflow"
+  SNOWFLAKE_CONNECTIONS_WORKFLOW_ACCOUNT: ${{secrets.SNOWFLAKE_ACCOUNT}}
+  SNOWFLAKE_CONNECTIONS_WORKFLOW_USER: ${{secrets.SNOWFLAKE_USER}}
+  SNOWFLAKE_CONNECTIONS_WORKFLOW_PRIVATE_KEY_RAW: ${{secrets.PRIVATE_KEY_RAW}}
+  SNOWFLAKE_CONNECTIONS_WORKFLOW_PRIVATE_KEY_PASSPHRASE: ${{secrets.PRIVATE_KEY_PASSPHRASE}}
+
+  GIT_REPO_DB: MY_GIT_REPOS
+  GIT_REPO_SCHEMA: GITHUB
+  GIT_REPO_NAME: ${{github.event.repository.name}}
+  GITHUB_PAT_SECRET: ${{secrets.GH_PAT}}
+  GITHUB_REF_NAME: ${{ github.ref_name }}
+
+  BAKERY_APP_NAME: bakery_app
+  BAKERY_APP_WH: BAKERY_WH
+  BAKERY_APP_DB: BAKERY_DB
+  BAKERY_APP_SCHEMA: APPS
+  BAKERY_DATA_SCHEMA: ORDERS
+
+jobs:
+  Deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # clone github repository's files into the virtual machine's working directory($GITHUB_WORKSPACE)
+      - uses: actions/checkout@v4
+        with:
+          # bakery update to pick the right branch
+          ref: ${{env.GITHUB_REF_NAME}}
+      - name: List files in the workspace
+        run: ls -al ${{github.workspace}}
+      
+      - uses: Snowflake-Labs/snowflake-cli-action@v1.5
+        with:
+          cli-version: "latest"
+          default-config-file-path: "${{github.workspace}}/config/config.toml"
+
+      # Write private key
+      - name: Configure private key
+        run: |
+            printf "%s" "${{secrets.PRIVATE_KEY_RAW}}" > ${{github.workspace}}/config/snowflake_rsa_key
+            chmod 600 ${{github.workspace}}/config/snowflake_rsa_key 
+      
+      - name: List files in the config directory - private key
+        run: ls -al ${{github.workspace}}/config
+      
+      # check connection
+      - name: Check version and verify connection
+        run: |
+            snow --version 
+            snow connection test
+            echo "Using branch $GITHUB_REF_NAME"
+
+      - name: Safe Infrastructure setup (Idempotent - database and schema for git intergration)
+        run: |
+          echo "Building required Git integrations inside snowflake if they don't exist."
+          snow sql -q "
+              -- 1.create database and schema for the Github repository if they don't exist.
+              CREATE DATABASE IF NOT EXISTS ${{env.GIT_REPO_DB}};
+              CREATE SCHEMA IF NOT EXISTS ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}};
+              "
+      - name: Safe Infrastructure setup (Idempotent - build secret)
+        run: |
+          echo "Building required Git integrations inside snowflake if they don't exist."
+          snow sql -q "
+        
+            use database ${{env.GIT_REPO_DB}};
+            use schema ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}};
+
+            -- 2.create the secire password secret hollding the GITHUB TOKEN
+            CREATE OR REPLACE SECRET github_pat_secret
+              TYPE = PASSWORD
+              USERNAME = '${{github.repository_owner}}'
+              PASSWORD = '${{env.GITHUB_PAT_SECRET}}';
+          "
+
+      - name: Safe Infrastructure setup (Idempotent - build API Integration)
+        run: |
+          echo "Building required Git integrations inside Snowflake if they don't exist."
+          snow sql -q "
+              use database ${{env.GIT_REPO_DB}};
+              use schema ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}};
+
+              -- 3.Create the network rule API Integration allowing snowflake out to GITHUB
+              CREATE API INTEGRATION IF NOT EXISTS github_api_int
+                API_PROVIDER = git_https_api
+                API_ALLOWED_PREFIXES = ('https://github.com')
+                ALLOWED_AUTHENTICATION_SECRETS = (${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}}.github_pat_secret)
+                ENABLED = TRUE;
+              "
+      - name: Safe Infrastructure Setup (Idempotent - build Git repository)
+        run: |
+          echo "Building required Git integrations inside Snowflake if they don't exist."
+          snow sql -q "
+              use database ${{env.GIT_REPO_DB}};
+              use schema ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}};
+              -- 4.create the GIT Repository stage mapping to your codebase
+              CREATE GIT REPOSITORY IF NOT EXISTS ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}}.${{env.GIT_REPO_NAME}}
+                API_INTEGRATION = github_api_int
+                GIT_CREDENTIALS = ${{ env.GIT_REPO_DB }}.${{ env.GIT_REPO_SCHEMA }}.github_pat_secret
+                ORIGIN = 'https://github.com/${{github.repository_owner}}/${{env.GIT_REPO_NAME}}.git';
+          "
+
+      - name: Refresh Repo
+        env:
+            PRIVATE_KEY_PASSPHRASE: ${{secrets.PRIVATE_KEY_PASSPHRASE}}
+            GIT_REPO_FQN: ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}}.${{env.GIT_REPO_NAME}}
+        run: |
+            snow git fetch "$GIT_REPO_FQN"
+
+      - name: Setup Bakery App Database Objects
+        env: 
+            PRIVATE_KEY_PASSPHRASE: ${{secrets.PRIVATE_KEY_PASSPHRASE}}
+            GIT_REPO_FQN: ${{env.GIT_REPO_DB}}.${{env.GIT_REPO_SCHEMA}}.${{env.GIT_REPO_NAME}}
+        run: |
+            snow git execute @"${GIT_REPO_FQN}/branches/${GITHUB_REF_NAME}/de/" \
+              --variable "db_name='$BAKERY_APP_DB'" \
+              --variable "schema_name='$BAKERY_DATA_SCHEMA'" \
+              --variable "wh_name='$BAKERY_APP_WH'" \
+              --variable "git_repo_name='$GIT_REPO_FQN'" \
+              --variable "git_branch='$GITHUB_REF_NAME'" \
+              --variable "app_schema_name='$BAKERY_APP_SCHEMA'" \
+              --database $GIT_REPO_DB \
+              --schema $GIT_REPO_SCHEMA 
+
+      - name: Deploy BAKERY Streamlit App
+        env:
+          PRIVATE_KEY_PASSPHRASE: ${{secrets.PRIVATE_KEY_PASSPHRASE}}
+        run: |
+          snow streamlit deploy --replace \
+            --database $BAKERY_APP_DB \
+            --schema $BAKERY_APP_SCHEMA 
+        working-directory: app
+
+      - name: Get App URL
+        env:
+          PRIVATE_KEY_PASSPHRASE: ${{secrets.PRIVATE_KEY_PASSPHRASE}}
+        run: |
+          snow streamlit get-url $BAKERY_APP_NAME \
+            --database $BAKERY_APP_DB \
+            --schema $BAKERY_APP_SCHEMA 
+        working-directory: app

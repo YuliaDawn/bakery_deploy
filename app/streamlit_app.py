@@ -20,6 +20,9 @@ table_fqn = f"{db_name}.{schema_name}.{table}"
 
 # Connect to Snowflake and query the SUMMARY_ORDERS table
 df = session.table(table_fqn).to_pandas()
+if df.empty:
+    st.info("No data yet. The tasks may still be running; refresh in a minute.")
+    st.stop()
 
 # Make sure the quantity column is numeric, and format the date as a clean string
 df['TOTAL_QUANTITY'] = pd.to_numeric(df['TOTAL_QUANTITY'])
